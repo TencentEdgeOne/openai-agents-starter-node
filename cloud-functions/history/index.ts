@@ -8,11 +8,11 @@
  * returns it to the frontend for restoring the chat window after a page
  * refresh.
  *
- * Two-pass filtering (mirrors the original agents/history/index.ts):
- *   A. Filter out SDK session intermediate items (function_call,
- *      function_call_output, reasoning, etc.) — only keep "message" items.
- *   B. Group by run_id, keeping only the first user message and the last
- *      assistant message per run, so one round-trip = one Q&A pair.
+ * The chat handler writes a user-index copy for the sidebar, while the
+ * OpenAI Agents SDK session writes the same user input for model memory.
+ * This handler normalizes SDK records, merges same-run assistant fragments,
+ * and folds adjacent duplicate bubbles so refresh rehydrates one visible
+ * user message per turn.
  *
  * Following the official EdgeOne Pages Node Functions docs:
  *   - export `onRequestPost` for POST handlers
@@ -40,6 +40,11 @@ interface FrontendMessage {
   role: string;
   content: string;
   timestamp: number;
+}
+
+interface NormalizedMessage {
+  message: FrontendMessage;
+  runId?: string;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -97,6 +102,75 @@ function contentToText(content: unknown): string {
   return String(content);
 }
 
+function normalizeMessage(item: MemoryMessage): NormalizedMessage | null {
+  const role = item.role;
+  if (role !== 'user' && role !== 'assistant') return null;
+
+  const meta = item.metadata ?? {};
+  if (meta.agent_sdk_session) {
+    const itemType = meta.item_type as string | null | undefined;
+    if (itemType != null && itemType !== 'message') return null;
+  }
+
+  const content = contentToText(item.content);
+  if (!content) return null;
+
+  return {
+    message: {
+      id: item.messageId ?? `${role}-${item.createdAt ?? 0}`,
+      role,
+      content,
+      timestamp: item.createdAt ?? 0,
+    },
+    runId: meta.run_id as string | undefined,
+  };
+}
+
+function mergeAssistantFragments(items: NormalizedMessage[]): FrontendMessage[] {
+  const sorted = [...items].sort((a, b) => a.message.timestamp - b.message.timestamp);
+
+  const merged: FrontendMessage[] = [];
+  let lastRunId: string | undefined;
+
+  for (const { message, runId } of sorted) {
+    const previous = merged[merged.length - 1];
+    const sameRunAssistant = Boolean(
+      previous &&
+        runId &&
+        runId === lastRunId &&
+        previous.role === 'assistant' &&
+        message.role === 'assistant',
+    );
+
+    if (sameRunAssistant) {
+      previous.content += `\n\n${message.content}`;
+    } else {
+      merged.push({ ...message });
+      lastRunId = runId;
+    }
+  }
+
+  return merged;
+}
+
+function dedupeAdjacent(messages: FrontendMessage[]): FrontendMessage[] {
+  const deduped: FrontendMessage[] = [];
+
+  for (const message of messages) {
+    const previous = deduped[deduped.length - 1];
+    if (
+      previous &&
+      previous.role === message.role &&
+      previous.content === message.content
+    ) {
+      continue;
+    }
+    deduped.push(message);
+  }
+
+  return deduped;
+}
+
 // ── Handler ─────────────────────────────────────────────────
 
 export async function onRequestPost(context: any): Promise<Response> {
@@ -131,59 +205,13 @@ export async function onRequestPost(context: any): Promise<Response> {
       `[history] store.getMessages end: ${new Date(storeEndTime).toISOString()}, duration: ${storeEndTime - storeStartTime}ms (records: ${history.length})`,
     );
 
-    // Single-pass: filter SDK intermediate items + group by run_id
-    const messages: FrontendMessage[] = [];
-    const groups = new Map<
-      string,
-      { user: FrontendMessage | null; assistant: FrontendMessage | null; order: number }
-    >();
-
-    for (const item of history) {
-      const role = item.role;
-      if (role !== 'user' && role !== 'assistant') continue;
-
-      const meta = item.metadata ?? {};
-      if (meta.agent_sdk_session) {
-        const itemType = meta.item_type as string | null | undefined;
-        if (itemType != null && itemType !== 'message') continue;
-      }
-
-      const content = contentToText(item.content);
-      if (!content) continue;
-
-      const msg: FrontendMessage = {
-        id: item.messageId ?? `${role}-${item.createdAt ?? 0}`,
-        role,
-        content,
-        timestamp: item.createdAt ?? 0,
-      };
-
-      const runId = meta.run_id as string | undefined;
-      if (!runId) {
-        messages.push(msg);
-        continue;
-      }
-
-      if (!groups.has(runId)) {
-        groups.set(runId, { user: null, assistant: null, order: groups.size });
-      }
-
-      const group = groups.get(runId)!;
-      if (role === 'user' && group.user === null) {
-        group.user = msg;
-      } else if (role === 'assistant') {
-        group.assistant = msg;
-      }
-    }
-
-    const sorted = [...groups.values()].sort((a, b) => a.order - b.order);
-    for (const group of sorted) {
-      if (group.user) messages.push(group.user);
-      if (group.assistant) messages.push(group.assistant);
-    }
+    const visible = history
+      .map(normalizeMessage)
+      .filter((item): item is NormalizedMessage => item !== null);
+    const messages = dedupeAdjacent(mergeAssistantFragments(visible));
 
     logger.log(
-      `[history] end: ${new Date().toISOString()}, total: ${Date.now() - requestStartTime}ms (returned ${messages.length} messages)`,
+      `[history] end: ${new Date().toISOString()}, total: ${Date.now() - requestStartTime}ms (${history.length} raw -> ${visible.length} visible -> ${messages.length} bubbles)`,
     );
 
     return jsonResponse({ conversation_id: conversationId, messages });
