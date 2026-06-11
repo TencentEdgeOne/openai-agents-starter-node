@@ -12,7 +12,11 @@ import { z } from 'zod';
 // ========== Tool: Get Weather ==========
 const getWeather = tool({
   name: 'get_weather',
-  description: 'Get the current weather for a specified city.',
+  description:
+    'Fetch the current weather for one specific city. ' +
+    'This tool ONLY returns weather data — it does NOT give clothing advice. ' +
+    'When the user asks "what should I wear in <city>", call this tool first to get the ' +
+    'weather, then call `get_clothing_advice` separately, passing the JSON returned here.',
   parameters: z.object({
     city: z.string().describe('The city to get weather for'),
   }),
@@ -31,7 +35,13 @@ const getWeather = tool({
 // ========== Tool: Get Clothing Advice ==========
 const getClothingAdvice = tool({
   name: 'get_clothing_advice',
-  description: 'Give clothing advice based on weather conditions.',
+  description:
+    'Give clothing advice based on a weather description that the caller already has. ' +
+    'This tool does NOT fetch weather itself — call `get_weather` first if the user asks ' +
+    'about a specific city, then pass the resulting JSON (or any plain-text weather summary) ' +
+    'into this tool\'s `weather` parameter. ' +
+    'Important: this is a separate tool from `get_weather`. There is no combined ' +
+    '"get_clothing_weather" tool — the two must be invoked one after the other.',
   parameters: z.object({
     weather: z.string().describe('The weather description (JSON or plain text)'),
   }),
